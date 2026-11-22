@@ -4044,3 +4044,52 @@ fn rack_lost_retransmission_recovers() -> Result<()> {
     assert!(with < without, "rack={with:?} classic={without:?}");
     Ok(())
 }
+
+/// Sends 3 messages, drops the first packet (too few for classic 3-dup-SACK
+/// fast retransmit), and reports whether RACK cut the congestion window.
+fn rack_loss_cuts_cwnd(rel: ReliabilityType, val: u32) -> Result<bool> {
+    let si = 1u16;
+    let (mut pair, client_ch, server_ch) = rack_pair(true, 50)?;
+    pair.server_conn_mut(server_ch).ack_mode = AckMode::NoDelay;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+    pair.client_stream(client_ch, si)?.set_reliability_params(true, rel, val)?;
+    for k in 0..4 {
+        rack_write(&mut pair, client_ch, si, 100 + k)?;
+        pair.drive();
+        pair.time += Duration::from_millis(20);
+    }
+    let ssthresh_before = pair.client_conn_mut(client_ch).ssthresh;
+    let mut first = true;
+    for k in 0..3 {
+        rack_write(&mut pair, client_ch, si, k)?;
+        pair.client.drive(pair.time, pair.server.addr);
+        if first {
+            pair.client.outbound.clear();
+            first = false;
+        }
+        pair.drive_client();
+        pair.drive_server();
+        pair.time += Duration::from_millis(5);
+    }
+    let end = pair.time + Duration::from_millis(800); // before T3 (1 s RTO min)
+    while pair.time < end {
+        if !pair.step() {
+            pair.time += Duration::from_millis(1);
+        }
+    }
+    let c = pair.client_conn_mut(client_ch);
+    assert!(c.rack.lost_marked > 0, "RACK should have detected the loss");
+    Ok(c.ssthresh != ssthresh_before)
+}
+
+#[test]
+fn rack_unreliable_loss_does_not_cut_cwnd() -> Result<()> {
+    assert!(!rack_loss_cuts_cwnd(ReliabilityType::Rexmit, 0)?, "maxRetransmits=0 loss must not cut cwnd");
+    Ok(())
+}
+
+#[test]
+fn rack_reliable_loss_cuts_cwnd() -> Result<()> {
+    assert!(rack_loss_cuts_cwnd(ReliabilityType::Reliable, 0)?, "reliable loss must cut cwnd");
+    Ok(())
+}

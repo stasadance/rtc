@@ -3438,9 +3438,11 @@ impl Association {
         let reo_wnd = self.rack_reo_wnd(sacked);
         let rack_rtt = self.rack.rtt;
         let mut lost = 0usize;
+        // lost chunks that will actually be retransmitted (reliable / retries left)
+        let mut lost_retransmittable = 0usize;
         let mut earliest: Option<Instant> = None;
         for tsn in tsns {
-            let Some(c) = self.inflight_queue.get_mut(tsn) else { continue };
+            let Some(c) = self.inflight_queue.get(tsn) else { continue };
             if !c.is_outstanding() || c.retransmit {
                 continue;
             }
@@ -3450,8 +3452,14 @@ impl Association {
             }
             let deadline = ls + rack_rtt + reo_wnd;
             if deadline <= now {
-                c.retransmit = true;
+                let exhausted = self.retransmission_policy_exhausted(c, now, true);
+                if let Some(c) = self.inflight_queue.get_mut(tsn) {
+                    c.retransmit = true;
+                }
                 lost += 1;
+                if !exhausted {
+                    lost_retransmittable += 1;
+                }
             } else {
                 earliest = Some(earliest.map_or(deadline, |e: Instant| e.min(deadline)));
             }
@@ -3460,7 +3468,11 @@ impl Association {
         if lost > 0 {
             self.rack.lost_marked += lost as u64;
             self.t3_retransmit_pending = true;
-            if !self.in_fast_recovery {
+            // lagless policy: a lost chunk that will never be resent (unreliable,
+            // retries exhausted / lifetime expired) is abandoned via FORWARD-TSN
+            // and does not shrink cwnd. Random loss on fire-and-forget game state
+            // then stops throttling the association; reliable loss still does.
+            if lost_retransmittable > 0 && !self.in_fast_recovery {
                 // RFC 8985 9.3 / RFC 9260 7.2.3: one cwnd reduction per recovery episode
                 self.in_fast_recovery = true;
                 self.fast_recover_exit_point = self.my_next_tsn.wrapping_sub(1);
