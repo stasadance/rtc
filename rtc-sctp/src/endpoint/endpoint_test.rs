@@ -28,7 +28,6 @@ use assert_matches::assert_matches;
 use lazy_static::lazy_static;
 use log::{info, trace};
 use std::collections::VecDeque;
-use std::net::Ipv6Addr;
 use std::ops::RangeFrom;
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -211,11 +210,11 @@ impl Pair {
     pub fn new(endpoint_config: EndpointConfig, server_config: ServerConfig) -> Self {
         let endpoint_config = Arc::new(endpoint_config);
         let server_addr = SocketAddr::new(
-            Ipv6Addr::LOCALHOST.into(),
+            std::net::Ipv4Addr::LOCALHOST.into(),
             SERVER_PORTS.lock().unwrap().next().unwrap(),
         );
         let client_addr = SocketAddr::new(
-            Ipv6Addr::LOCALHOST.into(),
+            std::net::Ipv4Addr::LOCALHOST.into(),
             CLIENT_PORTS.lock().unwrap().next().unwrap(),
         );
 
@@ -3922,5 +3921,126 @@ fn test_abort_closes_both_sides() -> Result<()> {
 
     // Idempotent: the association is already closed.
     pair.client_conn_mut(client_ch).abort()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// RACK-TLP (lagless fork): deterministic loss sims on the simulated pair clock.
+// ---------------------------------------------------------------------------
+
+fn rack_pair(rack: bool, latency_ms: u64) -> Result<(Pair, AssociationHandle, AssociationHandle)> {
+    let tc = TransportConfig::default().with_rack(rack);
+    let mut pair = Pair::new(
+        EndpointConfig::default(),
+        ServerConfig { transport: Arc::new(tc.clone()), ..Default::default() },
+    );
+    let (client_ch, server_ch) = pair.connect_with(ClientConfig { transport: Arc::new(tc) });
+    pair.latency = Duration::from_millis(latency_ms);
+    Ok((pair, client_ch, server_ch))
+}
+
+fn rack_write(pair: &mut Pair, ch: AssociationHandle, si: u16, tag: u8) -> Result<()> {
+    let now = pair.time;
+    let mut b = vec![tag; 1000];
+    b[0] = tag;
+    pair.client_stream(ch, si)?
+        .write_sctp(now, &Bytes::from(b), PayloadProtocolIdentifier::Binary)?;
+    Ok(())
+}
+
+fn rack_read_all(pair: &mut Pair, ch: AssociationHandle, si: u16) -> Result<Vec<u8>> {
+    let mut got = vec![];
+    let mut buf = vec![0u8; 2000];
+    while let Some(chunks) = pair.server_stream(ch, si)?.read_sctp()? {
+        let n = chunks.read(&mut buf)?;
+        assert_eq!(n, 1000);
+        got.push(buf[0]);
+    }
+    Ok(got)
+}
+
+/// Writes `n` messages (one packet each), drops the packets at `drop_idx`,
+/// returns how long until all `n` are readable at the server.
+fn rack_scenario(rack: bool, n: u8, drop_idx: &[usize]) -> Result<Duration> {
+    rack_scenario_ack(rack, n, drop_idx, AckMode::Normal)
+}
+
+fn rack_scenario_ack(rack: bool, n: u8, drop_idx: &[usize], ack: AckMode) -> Result<Duration> {
+    let si = 1u16;
+    let (mut pair, client_ch, server_ch) = rack_pair(rack, 50)?;
+    pair.server_conn_mut(server_ch).ack_mode = ack;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+    // warm the RTT estimator
+    for k in 0..4 {
+        rack_write(&mut pair, client_ch, si, 100 + k)?;
+        pair.drive();
+        pair.time += Duration::from_millis(20);
+    }
+    rack_read_all(&mut pair, server_ch, si)?;
+    let start = pair.time;
+    let mut sent = 0usize;
+    for k in 0..n {
+        rack_write(&mut pair, client_ch, si, k)?;
+        pair.client.drive(pair.time, pair.server.addr);
+        let mut kept = VecDeque::new();
+        for x in pair.client.outbound.drain(..) {
+            let drop_it = drop_idx.contains(&sent);
+            sent += 1;
+            if !drop_it {
+                kept.push_back(x);
+            }
+        }
+        pair.client.outbound = kept;
+        pair.drive_client();
+        pair.drive_server();
+        pair.time += Duration::from_millis(5);
+    }
+    let mut got = vec![];
+    while got.len() < n as usize {
+        if !pair.step() {
+            pair.time += Duration::from_millis(1);
+        }
+        got.extend(rack_read_all(&mut pair, server_ch, si)?);
+        assert!(pair.time - start < Duration::from_secs(30), "never recovered");
+    }
+    Ok(pair.time - start)
+}
+
+#[test]
+fn rack_tail_loss_recovers_by_probe_not_rto() -> Result<()> {
+    // last packet lost: no later SACK can reveal it, only TLP or T3-rtx
+    // receiver SACKs promptly (dense game traffic); delayed-ack case below
+    let with = rack_scenario_ack(true, 3, &[2], AckMode::NoDelay)?;
+    let without = rack_scenario_ack(false, 3, &[2], AckMode::NoDelay)?;
+    println!("tail loss: rack={with:?} classic={without:?}");
+    assert!(without >= Duration::from_millis(1000), "classic should wait for RTO: {without:?}");
+    assert!(with < Duration::from_millis(700), "RACK-TLP should probe in ~2*SRTT: {with:?}");
+    // with 200 ms delayed SACKs SRTT inflates, but the probe still beats T3-rtx
+    let with_d = rack_scenario(true, 3, &[2])?;
+    let without_d = rack_scenario(false, 3, &[2])?;
+    println!("tail loss (delayed ack): rack={with_d:?} classic={without_d:?}");
+    assert!(with_d < without_d);
+    Ok(())
+}
+
+#[test]
+fn rack_detects_loss_without_three_dupacks() -> Result<()> {
+    // first of two lost: only one SACK reports the gap, classic needs 3
+    let with = rack_scenario(true, 2, &[0])?;
+    let without = rack_scenario(false, 2, &[0])?;
+    println!("early loss: rack={with:?} classic={without:?}");
+    assert!(without >= Duration::from_millis(1000), "classic should wait for RTO: {without:?}");
+    assert!(with < Duration::from_millis(500), "RACK should mark lost after reo_wnd: {with:?}");
+    Ok(())
+}
+
+#[test]
+fn rack_lost_retransmission_recovers() -> Result<()> {
+    // first packet AND its first retransmission are lost (drop idx 0, then the
+    // retransmission is the 4th client datagram after the 3 originals)
+    let with = rack_scenario(true, 3, &[0, 3])?;
+    let without = rack_scenario(false, 3, &[0, 3])?;
+    println!("lost rtx: rack={with:?} classic={without:?}");
+    assert!(with < without, "rack={with:?} classic={without:?}");
     Ok(())
 }
