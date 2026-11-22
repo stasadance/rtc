@@ -139,6 +139,41 @@ const WC_DEL_ACK_MS: u64 = 200;
 /// Window for the RACK min-RTT filter.
 const RACK_MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
 
+/// Live sender-side state of an association (see [`Association::transport_stats`]).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TransportStats {
+    /// smoothed RTT (ms)
+    pub srtt_ms: u64,
+    /// current retransmission timeout (ms)
+    pub rto_ms: u64,
+    /// windowed minimum RTT (RACK filter), when RACK is enabled
+    pub min_rtt_ms: Option<u64>,
+    /// congestion window (bytes)
+    pub cwnd: u32,
+    /// slow-start threshold (bytes)
+    pub ssthresh: u32,
+    /// peer receive window (bytes)
+    pub rwnd: u32,
+    /// path MTU budget (bytes)
+    pub mtu: u32,
+    /// user bytes sent and not yet acked/abandoned
+    pub inflight_bytes: usize,
+    /// user bytes queued, not yet sent
+    pub pending_bytes: usize,
+    /// total user bytes acked by the peer
+    pub acked_bytes_total: u64,
+    /// in a loss-recovery episode
+    pub in_fast_recovery: bool,
+    /// chunks RACK marked lost
+    pub rack_lost: u64,
+    /// tail loss probes sent
+    pub rack_probes: u64,
+    /// T3-rtx timeouts
+    pub t3_timeouts: u64,
+    /// classic fast retransmissions
+    pub fast_retrans: u64,
+}
+
 /// RACK-TLP sender state (RFC 8985).
 #[derive(Debug, Default, Clone)]
 pub(crate) struct RackState {
@@ -269,6 +304,8 @@ pub struct Association {
     /// RACK-TLP (RFC 8985) enabled for this association.
     pub(crate) rack_enabled: bool,
     pub(crate) rack: RackState,
+    /// total user bytes acknowledged by the peer (delivery-rate signal)
+    pub(crate) acked_bytes_total: u64,
     fast_recover_exit_point: u32,
 
     // Chunks stored for retransmission
@@ -366,6 +403,7 @@ impl Default for Association {
             in_fast_recovery: false,
             rack_enabled: false,
             rack: RackState::default(),
+            acked_bytes_total: 0,
             fast_recover_exit_point: 0,
 
             // Chunks stored for retransmission
@@ -633,6 +671,27 @@ impl Association {
                     trace!("discarding invalid partial_decode");
                 }
             } //TODO:
+        }
+    }
+
+    /// Live sender-side transport state, for application pacing.
+    pub fn transport_stats(&self) -> TransportStats {
+        TransportStats {
+            srtt_ms: self.rto_mgr.srtt,
+            rto_ms: self.rto_mgr.get_rto(),
+            min_rtt_ms: self.rack.min_rtt().map(|d| d.as_millis() as u64),
+            cwnd: self.cwnd,
+            ssthresh: self.ssthresh,
+            rwnd: self.rwnd,
+            mtu: self.mtu,
+            inflight_bytes: self.inflight_queue.get_num_bytes(),
+            pending_bytes: self.pending_queue.get_num_bytes(),
+            acked_bytes_total: self.acked_bytes_total,
+            in_fast_recovery: self.in_fast_recovery,
+            rack_lost: self.rack.lost_marked,
+            rack_probes: self.rack.probes,
+            t3_timeouts: self.stats.n_t3timeouts,
+            fast_retrans: self.stats.n_fast_retrans,
         }
     }
 
@@ -1517,6 +1576,7 @@ impl Association {
         // Process selective ack
         let (bytes_acked_per_stream, total_bytes_acked, htna) =
             self.process_selective_ack(d, now)?;
+        self.acked_bytes_total += total_bytes_acked.max(0) as u64;
 
         let mut cum_tsn_ack_point_advanced = false;
         if sna32lt(self.cumulative_tsn_ack_point, d.cumulative_tsn_ack) {

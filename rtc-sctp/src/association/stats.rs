@@ -3,9 +3,9 @@
 pub struct AssociationStats {
     n_datas: u64,
     n_sacks: u64,
-    n_t3timeouts: u64,
+    pub(crate) n_t3timeouts: u64,
     n_ack_timeouts: u64,
-    n_fast_retrans: u64,
+    pub(crate) n_fast_retrans: u64,
 }
 
 impl AssociationStats {
