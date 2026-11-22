@@ -28,7 +28,6 @@ use assert_matches::assert_matches;
 use lazy_static::lazy_static;
 use log::{info, trace};
 use std::collections::VecDeque;
-use std::net::Ipv6Addr;
 use std::ops::RangeFrom;
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -211,11 +210,11 @@ impl Pair {
     pub fn new(endpoint_config: EndpointConfig, server_config: ServerConfig) -> Self {
         let endpoint_config = Arc::new(endpoint_config);
         let server_addr = SocketAddr::new(
-            Ipv6Addr::LOCALHOST.into(),
+            std::net::Ipv4Addr::LOCALHOST.into(),
             SERVER_PORTS.lock().unwrap().next().unwrap(),
         );
         let client_addr = SocketAddr::new(
-            Ipv6Addr::LOCALHOST.into(),
+            std::net::Ipv4Addr::LOCALHOST.into(),
             CLIENT_PORTS.lock().unwrap().next().unwrap(),
         );
 
