@@ -74,6 +74,8 @@ pub struct TransportConfig {
     max_num_inbound_streams: u16,
     timer_config: TimerConfig,
     stream_scheduler: StreamScheduler,
+    rack: bool,
+    rto_min: Option<u64>,
 }
 
 impl Default for TransportConfig {
@@ -86,6 +88,8 @@ impl Default for TransportConfig {
             max_num_inbound_streams: u16::MAX,
             timer_config: TimerConfig::default(),
             stream_scheduler: StreamScheduler::default(),
+            rack: false,
+            rto_min: None,
         }
     }
 }
@@ -132,6 +136,30 @@ impl TransportConfig {
     pub fn with_stream_scheduler(mut self, value: StreamScheduler) -> Self {
         self.stream_scheduler = value;
         self
+    }
+
+    /// Enables RACK-TLP loss detection (RFC 8985, draft-tuexen-tsvwg-rack-sctp):
+    /// time-based loss marking plus a tail loss probe, so tail losses recover in
+    /// ~2 SRTT instead of waiting for a T3-rtx timeout (cwnd -> 1 MTU, RTO backoff).
+    pub fn with_rack(mut self, enabled: bool) -> Self {
+        self.rack = enabled;
+        self
+    }
+
+    /// Overrides the RTO lower bound in milliseconds (RFC 9260 default 1000).
+    pub fn with_rto_min(mut self, ms: u64) -> Self {
+        self.rto_min = Some(ms);
+        self
+    }
+
+    /// Whether RACK-TLP is enabled.
+    pub fn rack(&self) -> bool {
+        self.rack
+    }
+
+    /// The configured RTO lower bound override, if any.
+    pub fn rto_min(&self) -> Option<u64> {
+        self.rto_min
     }
 
     /// The configured SCTP port.

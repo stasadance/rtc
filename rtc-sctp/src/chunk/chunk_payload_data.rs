@@ -176,6 +176,9 @@ pub struct ChunkPayloadData {
     /// Retransmission flag set when T1-RTX timeout occurred and this
     /// chunk is still in the inflight queue
     pub(crate) retransmit: bool,
+
+    /// Time of the most recent (re)transmission. RACK (RFC 8985) orders by this.
+    pub(crate) last_sent: Option<Instant>,
 }
 
 impl Default for ChunkPayloadData {
@@ -200,6 +203,7 @@ impl Default for ChunkPayloadData {
             nsent: 0,
             abandoned: false,
             retransmit: false,
+            last_sent: None,
         }
     }
 }
@@ -285,6 +289,7 @@ impl Chunk for ChunkPayloadData {
             nsent: 0,
             abandoned: false,
             retransmit: false,
+            last_sent: None,
         })
     }
 

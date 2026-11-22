@@ -134,6 +134,40 @@ struct MessageToAbandon {
     sent_tsn: Option<u32>,
 }
 
+/// Receiver worst-case delayed ack used by TLP when one chunk is in flight.
+const WC_DEL_ACK_MS: u64 = 200;
+/// Window for the RACK min-RTT filter.
+const RACK_MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
+
+/// RACK-TLP sender state (RFC 8985).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct RackState {
+    /// RACK.xmit_ts: last send time of the most recently sent delivered chunk
+    pub(crate) xmit_ts: Option<Instant>,
+    /// RACK.rtt: RTT measured on that chunk
+    pub(crate) rtt: Duration,
+    min_rtt: Option<(Duration, Instant)>,
+    pub(crate) highest_delivered_tsn: Option<u32>,
+    pub(crate) reordering_seen: bool,
+    /// chunks marked lost by RACK
+    pub(crate) lost_marked: u64,
+    /// tail loss probes fired
+    pub(crate) probes: u64,
+}
+
+impl RackState {
+    fn min_rtt(&self) -> Option<Duration> {
+        self.min_rtt.map(|(d, _)| d)
+    }
+    fn update_min_rtt(&mut self, rtt: Duration, now: Instant) {
+        match self.min_rtt {
+            Some((m, at)) if rtt > m && now.saturating_duration_since(at) < RACK_MIN_RTT_WINDOW => {}
+            _ => self.min_rtt = Some((rtt, now)),
+        }
+    }
+}
+
+
 ///Association represents an SCTP association
 //13.2.  Parameters Necessary per Association (i.e., the TCB)
 //Peer : Tag value to be sent in every packet and is received
@@ -232,6 +266,9 @@ pub struct Association {
     pub(crate) ssthresh: u32,
     partial_bytes_acked: u32,
     pub(crate) in_fast_recovery: bool,
+    /// RACK-TLP (RFC 8985) enabled for this association.
+    pub(crate) rack_enabled: bool,
+    pub(crate) rack: RackState,
     fast_recover_exit_point: u32,
 
     // Chunks stored for retransmission
@@ -327,6 +364,8 @@ impl Default for Association {
             ssthresh: 0,
             partial_bytes_acked: 0,
             in_fast_recovery: false,
+            rack_enabled: false,
+            rack: RackState::default(),
             fast_recover_exit_point: 0,
 
             // Chunks stored for retransmission
@@ -416,9 +455,13 @@ impl Association {
             cumulative_tsn_ack_point: tsn - 1,
             advanced_peer_tsn_ack_point: tsn - 1,
             error: None,
+            rack_enabled: config.rack(),
 
             ..Default::default()
         };
+        if let Some(ms) = config.rto_min() {
+            this.rto_mgr.rto_min = ms;
+        }
 
         if side.is_client() {
             let mut init = ChunkInit {
@@ -532,6 +575,12 @@ impl Association {
 
             if timer == Timer::Ack {
                 self.on_ack_timeout();
+            } else if timer == Timer::Rack {
+                self.timers.reset_retrans(timer);
+                self.rack_detect_loss(now);
+            } else if timer == Timer::Pto {
+                self.timers.reset_retrans(timer);
+                self.on_pto_timeout(now);
             } else if failure {
                 self.on_retransmission_failure(timer);
             } else {
@@ -1500,6 +1549,11 @@ impl Association {
 
         self.process_fast_retransmission(d.cumulative_tsn_ack, htna, cum_tsn_ack_point_advanced)?;
 
+        if self.rack_enabled {
+            self.rack_detect_loss(now);
+            self.rack_arm_pto(now, 0);
+        }
+
         if self.use_forward_tsn {
             // RFC 3758 Sec 3.5 C1
             if sna32lt(
@@ -1772,6 +1826,9 @@ impl Association {
             if let Some(mut c) = self.inflight_queue.pop(i) {
                 if c.acknowledge() {
                     newly_acked_data |= c.nsent > 0;
+                    if self.rack_enabled && !c.abandoned() {
+                        self.rack_on_delivered(c.tsn, c.nsent, c.last_sent, now);
+                    }
 
                     let n_bytes_acked = c.user_data.len() as i64;
                     total_bytes_acked += n_bytes_acked;
@@ -1835,6 +1892,14 @@ impl Association {
                     0
                 };
 
+                if self.rack_enabled && newly_acknowledged {
+                    if let Some(c) = self.inflight_queue.get(tsn) {
+                        if !c.abandoned() {
+                            let (t, n, ls) = (c.tsn, c.nsent, c.last_sent);
+                            self.rack_on_delivered(t, n, ls, now);
+                        }
+                    }
+                }
                 if let Some(c) = self.inflight_queue.get(tsn) {
                     if newly_acknowledged {
                         newly_acked_data |= c.nsent > 0;
@@ -2505,6 +2570,7 @@ impl Association {
             for chunk in &mut to_fast_retrans {
                 if let Some(c) = self.inflight_queue.get_mut(chunk.tsn) {
                     c.nsent += 1;
+                    c.last_sent = Some(now);
                     chunk.nsent = c.nsent;
                     self.stats.inc_fast_retrans();
                     trace!(
@@ -2683,6 +2749,7 @@ impl Association {
             if let Some(c) = self.inflight_queue.get_mut(chunk.tsn) {
                 c.retransmit = false;
                 c.nsent += 1;
+                c.last_sent = Some(now);
                 chunk.nsent = c.nsent;
                 trace!(
                     "[{}] retransmitting tsn={} ssn={} sent={}",
@@ -3230,7 +3297,11 @@ impl Association {
 
             // RTT baseline only; maxPacketLifeTime measures from `created_at`.
             c.since = Some(now);
+            c.last_sent = Some(now);
             c.nsent = 1; // being sent for the first time
+            if self.rack_enabled && self.timers.get(Timer::Pto).is_none() {
+                self.rack_arm_pto(now, 1);
+            }
 
             trace!(
                 "[{}] sending ppi={} tsn={} ssn={} sent={} len={} ({},{})",
@@ -3307,6 +3378,145 @@ impl Association {
 
     fn awake_write_loop(&self) {
         // No Op on Purpose
+    }
+
+    // ---------------------------------------------------------------------
+    // RACK-TLP (RFC 8985; draft-tuexen-tsvwg-rack-sctp). Ported in spirit from
+    // pion/sctp. Loss = sent more than reo_wnd before the most recently
+    // delivered chunk; tail losses are probed after ~2*SRTT instead of T3-rtx.
+    // ---------------------------------------------------------------------
+
+    /// Called for every newly acknowledged (cum or gap) chunk.
+    fn rack_on_delivered(&mut self, tsn: u32, nsent: u32, last_sent: Option<Instant>, now: Instant) {
+        let Some(ls) = last_sent else { return };
+        let rtt = now.saturating_duration_since(ls);
+        if nsent > 1 {
+            // RFC 8985 6.2 step 2: ignore a possibly spurious retransmission ack.
+            if let Some(min) = self.rack.min_rtt() {
+                if rtt < min {
+                    return;
+                }
+            }
+        } else {
+            self.rack.update_min_rtt(rtt, now);
+            // reordering: an original send acked below the highest delivered original
+            match self.rack.highest_delivered_tsn {
+                Some(h) if sna32lt(tsn, h) => self.rack.reordering_seen = true,
+                Some(h) if sna32gte(tsn, h) => self.rack.highest_delivered_tsn = Some(tsn),
+                None => self.rack.highest_delivered_tsn = Some(tsn),
+                _ => {}
+            }
+        }
+        // RACK.xmit_ts / RACK.rtt track the most recently *sent* delivered chunk
+        if self.rack.xmit_ts.is_none_or(|x| ls > x) {
+            self.rack.xmit_ts = Some(ls);
+            self.rack.rtt = rtt;
+        }
+    }
+
+    fn rack_reo_wnd(&self, sacked: usize) -> Duration {
+        // RFC 8985 6.2 step 4
+        if !self.rack.reordering_seen && (self.in_fast_recovery || sacked >= 3) {
+            return Duration::ZERO;
+        }
+        let base = self.rack.min_rtt().unwrap_or_default() / 4;
+        let srtt = Duration::from_millis(self.rto_mgr.srtt);
+        if srtt > Duration::ZERO { base.min(srtt) } else { base }
+    }
+
+    /// RFC 8985 6.2 step 5 + 6.3 timer. Marks lost chunks for retransmission.
+    fn rack_detect_loss(&mut self, now: Instant) {
+        let Some(xmit_ts) = self.rack.xmit_ts else {
+            self.timers.stop(Timer::Rack);
+            return;
+        };
+        let tsns: Vec<u32> = self.inflight_queue.sorted.iter().copied().collect();
+        let sacked = tsns
+            .iter()
+            .filter(|t| self.inflight_queue.get(**t).is_some_and(|c| c.acknowledged))
+            .count();
+        let reo_wnd = self.rack_reo_wnd(sacked);
+        let rack_rtt = self.rack.rtt;
+        let mut lost = 0usize;
+        let mut earliest: Option<Instant> = None;
+        for tsn in tsns {
+            let Some(c) = self.inflight_queue.get_mut(tsn) else { continue };
+            if !c.is_outstanding() || c.retransmit {
+                continue;
+            }
+            let Some(ls) = c.last_sent else { continue };
+            if ls > xmit_ts {
+                continue; // sent after the newest delivered chunk: no evidence yet
+            }
+            let deadline = ls + rack_rtt + reo_wnd;
+            if deadline <= now {
+                c.retransmit = true;
+                lost += 1;
+            } else {
+                earliest = Some(earliest.map_or(deadline, |e: Instant| e.min(deadline)));
+            }
+        }
+        self.timers.set(Timer::Rack, earliest);
+        if lost > 0 {
+            self.rack.lost_marked += lost as u64;
+            self.t3_retransmit_pending = true;
+            if !self.in_fast_recovery {
+                // RFC 8985 9.3 / RFC 9260 7.2.3: one cwnd reduction per recovery episode
+                self.in_fast_recovery = true;
+                self.fast_recover_exit_point = self.my_next_tsn.wrapping_sub(1);
+                self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
+                self.cwnd = self.ssthresh;
+                self.partial_bytes_acked = 0;
+            }
+            self.awake_write_loop();
+        }
+    }
+
+    /// (Re)arm the tail loss probe. `extra_inflight` counts a chunk about to be
+    /// pushed to the in-flight queue.
+    fn rack_arm_pto(&mut self, now: Instant, extra_inflight: usize) {
+        let flight = self.inflight_queue.len() + extra_inflight;
+        if flight == 0 {
+            self.timers.set(Timer::Pto, None);
+            return;
+        }
+        let srtt = self.rto_mgr.srtt;
+        let mut pto = if srtt > 0 { 2 * srtt } else { 1000 };
+        if flight == 1 {
+            pto += WC_DEL_ACK_MS; // peer may delay the SACK of a lone chunk
+        }
+        let deadline = now + Duration::from_millis(pto);
+        // RFC 8985 7.2: never later than the RTO.
+        if let Some(t3) = self.timers.get(Timer::T3RTX) {
+            if deadline >= t3 {
+                self.timers.set(Timer::Pto, None);
+                return;
+            }
+        }
+        self.timers.set(Timer::Pto, Some(deadline));
+    }
+
+    /// RFC 8985 7.3: probe with the highest outstanding chunk to elicit a SACK.
+    fn on_pto_timeout(&mut self, _now: Instant) {
+        let probe = self
+            .inflight_queue
+            .sorted
+            .iter()
+            .rev()
+            .copied()
+            .find(|t| self.inflight_queue.get(*t).is_some_and(|c| c.is_outstanding()));
+        if let Some(tsn) = probe {
+            if let Some(c) = self.inflight_queue.get_mut(tsn) {
+                c.retransmit = true;
+            }
+            self.rack.probes += 1;
+            self.t3_retransmit_pending = true;
+            self.awake_write_loop();
+        } else if self.use_forward_tsn {
+            // everything outstanding was abandoned: FORWARD-TSN elicits a SACK
+            self.advance_peer_ack_point();
+            self.awake_write_loop();
+        }
     }
 
     fn close_all_timers(&mut self) {

@@ -376,6 +376,10 @@ pub struct SettingEngine {
     pub(crate) sctp_mtu: Option<u32>,
     /// SCTP streams share the bytes sent by weight (RFC 8260 section 3.6), off by default.
     pub(crate) sctp_weighted_fair_queueing: bool,
+    /// RACK-TLP loss detection on the SCTP association (lagless fork).
+    pub(crate) sctp_rack: bool,
+    /// SCTP RTO lower bound override in ms (lagless fork).
+    pub(crate) sctp_rto_min: Option<u64>,
     pub(crate) ignore_rid_pause_for_recv: bool,
     pub(crate) write_ssrc_attributes_for_simulcast: bool,
 }
@@ -1427,6 +1431,18 @@ impl SettingEngineBuilder {
     /// RFC 8831 section 6.4), each channel's share of the bytes in proportion to its weight.
     pub fn with_sctp_weighted_fair_queueing(mut self, enabled: bool) -> Self {
         self.0.sctp_weighted_fair_queueing = enabled;
+        self
+    }
+
+    /// Enables RACK-TLP (RFC 8985) loss detection for the SCTP association.
+    pub fn with_sctp_rack(mut self, enabled: bool) -> Self {
+        self.0.sctp_rack = enabled;
+        self
+    }
+
+    /// Overrides the SCTP RTO lower bound in milliseconds (default 1000).
+    pub fn with_sctp_rto_min(mut self, ms: u64) -> Self {
+        self.0.sctp_rto_min = Some(ms);
         self
     }
 

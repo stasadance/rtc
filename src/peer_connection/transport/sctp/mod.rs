@@ -53,6 +53,8 @@ pub(crate) struct SctpTransport {
 
     // Streams share the bytes sent by weight (RFC 8260 section 3.6), off by default.
     pub(crate) weighted_fair_queueing: bool,
+    pub(crate) rack: bool,
+    pub(crate) rto_min: Option<u64>,
 
     pub(crate) internal_buffer: Vec<u8>,
 }
@@ -78,11 +80,19 @@ impl SctpTransport {
             max_receive_buffer_size,
             mtu,
             weighted_fair_queueing: false,
+            rack: false,
+            rto_min: None,
             internal_buffer: vec![],
         }
     }
 
     /// Schedules the association `start()` builds by weighted fair queueing.
+    pub(crate) fn with_rack(mut self, rack: bool, rto_min: Option<u64>) -> Self {
+        self.rack = rack;
+        self.rto_min = rto_min;
+        self
+    }
+
     pub(crate) fn with_weighted_fair_queueing(mut self, enabled: bool) -> Self {
         self.weighted_fair_queueing = enabled;
         self
@@ -197,7 +207,11 @@ impl SctpTransport {
         let mut sctp_transport_config = ::sctp::TransportConfig::default()
             .with_max_message_size(max_message_size)
             .with_sctp_port(local_port)
-            .with_stream_scheduler(scheduler);
+            .with_stream_scheduler(scheduler)
+            .with_rack(self.rack);
+        if let Some(ms) = self.rto_min {
+            sctp_transport_config = sctp_transport_config.with_rto_min(ms);
+        }
         if let Some(recv_buf) = self.max_receive_buffer_size {
             sctp_transport_config = sctp_transport_config.with_max_receive_buffer_size(recv_buf);
         }

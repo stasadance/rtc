@@ -4,7 +4,7 @@ pub(crate) const ACK_INTERVAL: u64 = 200;
 const MAX_INIT_RETRANS: usize = 8;
 const PATH_MAX_RETRANS: usize = 5;
 const NO_MAX_RETRANS: usize = usize::MAX;
-const TIMER_COUNT: usize = 6;
+const TIMER_COUNT: usize = 8;
 
 #[derive(Debug, Copy, Clone)]
 /// Retransmission limits for the association's timers.
@@ -49,6 +49,10 @@ pub(crate) enum Timer {
     T3RTX = 3,
     Reconfig = 4,
     Ack = 5,
+    /// RACK reordering-window timer (RFC 8985 6.3)
+    Rack = 6,
+    /// Tail loss probe timeout (RFC 8985 7)
+    Pto = 7,
 }
 
 impl Timer {
@@ -59,6 +63,8 @@ impl Timer {
         Timer::T3RTX,
         Timer::Reconfig,
         Timer::Ack,
+        Timer::Rack,
+        Timer::Pto,
     ];
 }
 
@@ -82,6 +88,8 @@ impl TimerTable {
                 time_config.max_t3_rtx_retrans,      //T3RTX
                 time_config.max_reconfig_retrans,    //Reconfig
                 time_config.max_ack_retrans,         //Ack
+                usize::MAX,                          //Rack
+                usize::MAX,                          //Pto
             ],
             ..Default::default()
         }
@@ -176,20 +184,30 @@ const RTO_BASE: u64 = 8;
 
 /// rtoManager manages Rtx timeout values.
 /// This is an implementation of RFC 9260 sec 6.3.1.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub(crate) struct RtoManager {
     pub(crate) srtt: u64,
     pub(crate) rttvar: f64,
     pub(crate) rto: u64,
     pub(crate) no_update: bool,
+    pub(crate) rto_min: u64,
+}
+
+impl Default for RtoManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RtoManager {
     /// newRTOManager creates a new rtoManager.
     pub(crate) fn new() -> Self {
         RtoManager {
+            srtt: 0,
+            rttvar: 0.0,
             rto: RTO_INITIAL,
-            ..Default::default()
+            no_update: false,
+            rto_min: RTO_MIN,
         }
     }
 
@@ -211,7 +229,7 @@ impl RtoManager {
             self.srtt = ((RTO_BASE - RTO_ALPHA) * self.srtt + RTO_ALPHA * rtt) / RTO_BASE;
         }
 
-        self.rto = (self.srtt + (4.0 * self.rttvar) as u64).clamp(RTO_MIN, RTO_MAX);
+        self.rto = (self.srtt + (4.0 * self.rttvar) as u64).clamp(self.rto_min, RTO_MAX);
 
         self.srtt
     }
