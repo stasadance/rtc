@@ -1101,14 +1101,16 @@ impl RTCPeerConnection {
             *count += 1;
         };
 
-        for (i, m) in media_sections.iter().enumerate() {
+        // candidates go on the first m-line that is not rejected
+        let mut candidates_added = false;
+        for m in media_sections.iter() {
             if m.data && m.transceiver_index != usize::MAX {
                 return Err(Error::ErrSDPMediaSectionMediaDataChanInvalid);
             } else if !m.data && m.transceiver_index >= transceivers.len() {
                 return Err(Error::ErrSDPMediaSectionTrackInvalid);
             }
 
-            let should_add_candidates = i == 0;
+            let should_add_candidates = !candidates_added;
 
             let should_add_id = if m.data {
                 let params = AddDataMediaSectionParams {
@@ -1144,6 +1146,7 @@ impl RTCPeerConnection {
                 should_add_id
             };
 
+            candidates_added |= should_add_id;
             if should_add_id {
                 if bundle_match(params.match_bundle_group.as_ref(), &m.mid) {
                     append_bundle(&m.mid, &mut bundle_value, &mut bundle_count);

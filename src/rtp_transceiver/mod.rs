@@ -566,4 +566,62 @@ mod tests {
         assert!(sections[2].contains("a=ssrc:4242 cname:germs"));
         assert!(sections[2].contains("a=msid:germs voice1"));
     }
+
+    #[test]
+    fn test_candidates_skip_rejected_mlines() {
+        use crate::peer_connection::transport::{
+            CandidateConfig, CandidateHostConfig, RTCIceCandidate,
+        };
+
+        let mut offerer = build_pc();
+        offerer
+            .add_transceiver_from_kind(RtpCodecKind::Audio, None)
+            .expect("add audio");
+        offerer
+            .create_data_channel("dc", None)
+            .expect("create data channel");
+        let offer = offerer.create_offer(None).expect("create offer");
+        offerer
+            .set_local_description(Instant::now(), offer.clone())
+            .expect("offerer set local");
+
+        // no codecs: the audio m-line is rejected, only the data m-line is accepted
+        let mut answerer = RTCPeerConnectionBuilder::new()
+            .build(Instant::now())
+            .expect("build answerer");
+        answerer
+            .set_remote_description(Instant::now(), offer)
+            .expect("answerer set remote");
+        let cand = CandidateHostConfig {
+            base_config: CandidateConfig {
+                network: "udp".to_owned(),
+                address: "127.0.0.1".to_owned(),
+                port: 5000,
+                component: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()
+        .expect("candidate");
+        answerer
+            .add_local_candidate(RTCIceCandidate::from(&cand).to_json().expect("json"))
+            .expect("add local candidate");
+        let answer = answerer.create_answer(None).expect("create answer");
+        answerer
+            .set_local_description(Instant::now(), answer)
+            .expect("answerer set local");
+        let sdp = answerer.local_description().expect("local description").sdp;
+        let sections: Vec<&str> = sdp.split("\r\nm=").skip(1).collect();
+        assert_eq!(sections.len(), 2);
+        assert!(sections[0].starts_with("audio 0 "), "audio rejected: {sdp}");
+        assert!(
+            !sections[0].contains("a=candidate"),
+            "no candidates on a rejected m-line: {sdp}"
+        );
+        assert!(
+            sections[1].contains("a=candidate"),
+            "candidates on the data m-line: {sdp}"
+        );
+    }
 }

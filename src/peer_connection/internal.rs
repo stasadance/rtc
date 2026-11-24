@@ -429,7 +429,14 @@ impl RTCPeerConnection {
             };
 
             if !parsed.media_descriptions.is_empty() {
-                let mut m = parsed.media_descriptions.remove(0);
+                // the first m-line that is not rejected (port 0): with BUNDLE that is the
+                // tagged one, and a browser ignores candidates on a rejected m-line
+                let i = parsed
+                    .media_descriptions
+                    .iter()
+                    .position(|m| m.media_name.port.value != 0)
+                    .unwrap_or(0);
+                let mut m = parsed.media_descriptions.remove(i);
                 m = match add_candidates_to_media_descriptions(
                     &candidates,
                     m,
@@ -438,7 +445,7 @@ impl RTCPeerConnection {
                     Ok(m) => m,
                     Err(_) => return Some(sd.clone()),
                 };
-                parsed.media_descriptions.insert(0, m);
+                parsed.media_descriptions.insert(i, m);
             }
 
             Some(RTCSessionDescription {
