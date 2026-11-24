@@ -147,6 +147,7 @@ impl TransportConfig {
     }
 
     /// Overrides the RTO lower bound in milliseconds (RFC 9260 default 1000).
+    /// Values above RTO.Max (60 s) are capped to it.
     pub fn with_rto_min(mut self, ms: u64) -> Self {
         self.rto_min = Some(ms);
         self

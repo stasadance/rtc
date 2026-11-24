@@ -28,6 +28,7 @@ use assert_matches::assert_matches;
 use lazy_static::lazy_static;
 use log::{info, trace};
 use std::collections::VecDeque;
+use std::net::Ipv6Addr;
 use std::ops::RangeFrom;
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -210,11 +211,11 @@ impl Pair {
     pub fn new(endpoint_config: EndpointConfig, server_config: ServerConfig) -> Self {
         let endpoint_config = Arc::new(endpoint_config);
         let server_addr = SocketAddr::new(
-            std::net::Ipv4Addr::LOCALHOST.into(),
+            Ipv6Addr::LOCALHOST.into(),
             SERVER_PORTS.lock().unwrap().next().unwrap(),
         );
         let client_addr = SocketAddr::new(
-            std::net::Ipv4Addr::LOCALHOST.into(),
+            Ipv6Addr::LOCALHOST.into(),
             CLIENT_PORTS.lock().unwrap().next().unwrap(),
         );
 
@@ -3925,16 +3926,21 @@ fn test_abort_closes_both_sides() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// RACK-TLP (lagless fork): deterministic loss sims on the simulated pair clock.
+// RACK-TLP (RFC 8985): deterministic loss sims on the simulated pair clock.
 // ---------------------------------------------------------------------------
 
 fn rack_pair(rack: bool, latency_ms: u64) -> Result<(Pair, AssociationHandle, AssociationHandle)> {
     let tc = TransportConfig::default().with_rack(rack);
     let mut pair = Pair::new(
         EndpointConfig::default(),
-        ServerConfig { transport: Arc::new(tc.clone()), ..Default::default() },
+        ServerConfig {
+            transport: Arc::new(tc.clone()),
+            ..Default::default()
+        },
     );
-    let (client_ch, server_ch) = pair.connect_with(ClientConfig { transport: Arc::new(tc) });
+    let (client_ch, server_ch) = pair.connect_with(ClientConfig {
+        transport: Arc::new(tc),
+    });
     pair.latency = Duration::from_millis(latency_ms);
     Ok((pair, client_ch, server_ch))
 }
@@ -3943,8 +3949,11 @@ fn rack_write(pair: &mut Pair, ch: AssociationHandle, si: u16, tag: u8) -> Resul
     let now = pair.time;
     let mut b = vec![tag; 1000];
     b[0] = tag;
-    pair.client_stream(ch, si)?
-        .write_sctp(now, &Bytes::from(b), PayloadProtocolIdentifier::Binary)?;
+    pair.client_stream(ch, si)?.write_sctp(
+        now,
+        &Bytes::from(b),
+        PayloadProtocolIdentifier::Binary,
+    )?;
     Ok(())
 }
 
@@ -4001,7 +4010,10 @@ fn rack_scenario_ack(rack: bool, n: u8, drop_idx: &[usize], ack: AckMode) -> Res
             pair.time += Duration::from_millis(1);
         }
         got.extend(rack_read_all(&mut pair, server_ch, si)?);
-        assert!(pair.time - start < Duration::from_secs(30), "never recovered");
+        assert!(
+            pair.time - start < Duration::from_secs(30),
+            "never recovered"
+        );
     }
     Ok(pair.time - start)
 }
@@ -4013,8 +4025,14 @@ fn rack_tail_loss_recovers_by_probe_not_rto() -> Result<()> {
     let with = rack_scenario_ack(true, 3, &[2], AckMode::NoDelay)?;
     let without = rack_scenario_ack(false, 3, &[2], AckMode::NoDelay)?;
     println!("tail loss: rack={with:?} classic={without:?}");
-    assert!(without >= Duration::from_millis(1000), "classic should wait for RTO: {without:?}");
-    assert!(with < Duration::from_millis(700), "RACK-TLP should probe in ~2*SRTT: {with:?}");
+    assert!(
+        without >= Duration::from_millis(1000),
+        "classic should wait for RTO: {without:?}"
+    );
+    assert!(
+        with < Duration::from_millis(700),
+        "RACK-TLP should probe in ~2*SRTT: {with:?}"
+    );
     // with 200 ms delayed SACKs SRTT inflates, but the probe still beats T3-rtx
     let with_d = rack_scenario(true, 3, &[2])?;
     let without_d = rack_scenario(false, 3, &[2])?;
@@ -4029,8 +4047,14 @@ fn rack_detects_loss_without_three_dupacks() -> Result<()> {
     let with = rack_scenario(true, 2, &[0])?;
     let without = rack_scenario(false, 2, &[0])?;
     println!("early loss: rack={with:?} classic={without:?}");
-    assert!(without >= Duration::from_millis(1000), "classic should wait for RTO: {without:?}");
-    assert!(with < Duration::from_millis(500), "RACK should mark lost after reo_wnd: {with:?}");
+    assert!(
+        without >= Duration::from_millis(1000),
+        "classic should wait for RTO: {without:?}"
+    );
+    assert!(
+        with < Duration::from_millis(500),
+        "RACK should mark lost after reo_wnd: {with:?}"
+    );
     Ok(())
 }
 
@@ -4052,7 +4076,8 @@ fn rack_loss_cuts_cwnd(rel: ReliabilityType, val: u32) -> Result<bool> {
     let (mut pair, client_ch, server_ch) = rack_pair(true, 50)?;
     pair.server_conn_mut(server_ch).ack_mode = AckMode::NoDelay;
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
-    pair.client_stream(client_ch, si)?.set_reliability_params(true, rel, val)?;
+    pair.client_stream(client_ch, si)?
+        .set_reliability_params(true, rel, val)?;
     for k in 0..4 {
         rack_write(&mut pair, client_ch, si, 100 + k)?;
         pair.drive();
@@ -4084,12 +4109,45 @@ fn rack_loss_cuts_cwnd(rel: ReliabilityType, val: u32) -> Result<bool> {
 
 #[test]
 fn rack_unreliable_loss_does_not_cut_cwnd() -> Result<()> {
-    assert!(!rack_loss_cuts_cwnd(ReliabilityType::Rexmit, 0)?, "maxRetransmits=0 loss must not cut cwnd");
+    assert!(
+        !rack_loss_cuts_cwnd(ReliabilityType::Rexmit, 0)?,
+        "maxRetransmits=0 loss must not cut cwnd"
+    );
     Ok(())
 }
 
 #[test]
 fn rack_reliable_loss_cuts_cwnd() -> Result<()> {
-    assert!(rack_loss_cuts_cwnd(ReliabilityType::Reliable, 0)?, "reliable loss must cut cwnd");
+    assert!(
+        rack_loss_cuts_cwnd(ReliabilityType::Reliable, 0)?,
+        "reliable loss must cut cwnd"
+    );
+    Ok(())
+}
+
+#[test]
+fn transport_stats_reports_sender_state() -> Result<()> {
+    let si = 1u16;
+    let (mut pair, client_ch, server_ch) = rack_pair(true, 20)?;
+    pair.server_conn_mut(server_ch).ack_mode = AckMode::NoDelay;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+    let before = pair.client_conn_mut(client_ch).transport_stats();
+    for k in 0..5 {
+        rack_write(&mut pair, client_ch, si, k)?;
+    }
+    assert!(
+        pair.client_conn_mut(client_ch)
+            .transport_stats()
+            .pending_bytes
+            > 0
+    );
+    pair.drive();
+    let s = pair.client_conn_mut(client_ch).transport_stats();
+    assert_eq!(s.acked_bytes_total - before.acked_bytes_total, 5000);
+    assert_eq!(s.inflight_bytes, 0);
+    assert_eq!(s.pending_bytes, 0);
+    assert!(s.srtt_ms > 0 && s.cwnd > 0 && s.mtu > 0);
+    assert!(s.min_rtt_ms.is_some());
+    assert_eq!((s.rack_lost, s.rack_probes, s.t3_timeouts), (0, 0, 0));
     Ok(())
 }

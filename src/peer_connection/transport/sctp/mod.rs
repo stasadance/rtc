@@ -86,13 +86,14 @@ impl SctpTransport {
         }
     }
 
-    /// Schedules the association `start()` builds by weighted fair queueing.
+    /// Enables RACK-TLP and overrides the RTO lower bound for the association `start()` builds.
     pub(crate) fn with_rack(mut self, rack: bool, rto_min: Option<u64>) -> Self {
         self.rack = rack;
         self.rto_min = rto_min;
         self
     }
 
+    /// Schedules the association `start()` builds by weighted fair queueing.
     pub(crate) fn with_weighted_fair_queueing(mut self, enabled: bool) -> Self {
         self.weighted_fair_queueing = enabled;
         self

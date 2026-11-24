@@ -45,7 +45,7 @@ use crate::{AssociationEvent, Payload, Side};
 use shared::error::{Error, Result};
 use shared::{TransportContext, TransportMessage, TransportProtocol};
 use stream::{Stream, StreamEvent, StreamId, StreamState};
-use timer::{ACK_INTERVAL, RtoManager, Timer, TimerTable};
+use timer::{ACK_INTERVAL, RTO_MAX, RtoManager, Timer, TimerTable};
 
 use crate::association::stream::RecvSendState;
 use bytes::{Bytes, BytesMut};
@@ -141,6 +141,7 @@ const RACK_MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
 
 /// Live sender-side state of an association (see [`Association::transport_stats`]).
 #[derive(Debug, Default, Clone, Copy)]
+#[non_exhaustive]
 pub struct TransportStats {
     /// smoothed RTT (ms)
     pub srtt_ms: u64,
@@ -196,12 +197,12 @@ impl RackState {
     }
     fn update_min_rtt(&mut self, rtt: Duration, now: Instant) {
         match self.min_rtt {
-            Some((m, at)) if rtt > m && now.saturating_duration_since(at) < RACK_MIN_RTT_WINDOW => {}
+            Some((m, at)) if rtt > m && now.saturating_duration_since(at) < RACK_MIN_RTT_WINDOW => {
+            }
             _ => self.min_rtt = Some((rtt, now)),
         }
     }
 }
-
 
 ///Association represents an SCTP association
 //13.2.  Parameters Necessary per Association (i.e., the TCB)
@@ -498,7 +499,7 @@ impl Association {
             ..Default::default()
         };
         if let Some(ms) = config.rto_min() {
-            this.rto_mgr.rto_min = ms;
+            this.rto_mgr.rto_min = ms.min(RTO_MAX);
         }
 
         if side.is_client() {
@@ -1952,13 +1953,13 @@ impl Association {
                     0
                 };
 
-                if self.rack_enabled && newly_acknowledged {
-                    if let Some(c) = self.inflight_queue.get(tsn) {
-                        if !c.abandoned() {
-                            let (t, n, ls) = (c.tsn, c.nsent, c.last_sent);
-                            self.rack_on_delivered(t, n, ls, now);
-                        }
-                    }
+                if self.rack_enabled
+                    && newly_acknowledged
+                    && let Some(c) = self.inflight_queue.get(tsn)
+                    && !c.abandoned()
+                {
+                    let (t, n, ls) = (c.tsn, c.nsent, c.last_sent);
+                    self.rack_on_delivered(t, n, ls, now);
                 }
                 if let Some(c) = self.inflight_queue.get(tsn) {
                     if newly_acknowledged {
@@ -3447,15 +3448,21 @@ impl Association {
     // ---------------------------------------------------------------------
 
     /// Called for every newly acknowledged (cum or gap) chunk.
-    fn rack_on_delivered(&mut self, tsn: u32, nsent: u32, last_sent: Option<Instant>, now: Instant) {
+    fn rack_on_delivered(
+        &mut self,
+        tsn: u32,
+        nsent: u32,
+        last_sent: Option<Instant>,
+        now: Instant,
+    ) {
         let Some(ls) = last_sent else { return };
         let rtt = now.saturating_duration_since(ls);
         if nsent > 1 {
             // RFC 8985 6.2 step 2: ignore a possibly spurious retransmission ack.
-            if let Some(min) = self.rack.min_rtt() {
-                if rtt < min {
-                    return;
-                }
+            if let Some(min) = self.rack.min_rtt()
+                && rtt < min
+            {
+                return;
             }
         } else {
             self.rack.update_min_rtt(rtt, now);
@@ -3481,7 +3488,11 @@ impl Association {
         }
         let base = self.rack.min_rtt().unwrap_or_default() / 4;
         let srtt = Duration::from_millis(self.rto_mgr.srtt);
-        if srtt > Duration::ZERO { base.min(srtt) } else { base }
+        if srtt > Duration::ZERO {
+            base.min(srtt)
+        } else {
+            base
+        }
     }
 
     /// RFC 8985 6.2 step 5 + 6.3 timer. Marks lost chunks for retransmission.
@@ -3502,7 +3513,9 @@ impl Association {
         let mut lost_retransmittable = 0usize;
         let mut earliest: Option<Instant> = None;
         for tsn in tsns {
-            let Some(c) = self.inflight_queue.get(tsn) else { continue };
+            let Some(c) = self.inflight_queue.get(tsn) else {
+                continue;
+            };
             if !c.is_outstanding() || c.retransmit {
                 continue;
             }
@@ -3528,10 +3541,10 @@ impl Association {
         if lost > 0 {
             self.rack.lost_marked += lost as u64;
             self.t3_retransmit_pending = true;
-            // lagless policy: a lost chunk that will never be resent (unreliable,
-            // retries exhausted / lifetime expired) is abandoned via FORWARD-TSN
-            // and does not shrink cwnd. Random loss on fire-and-forget game state
-            // then stops throttling the association; reliable loss still does.
+            // A lost chunk that will never be resent (partial reliability with
+            // retransmissions or lifetime exhausted, RFC 3758 / RFC 7496) is
+            // abandoned via FORWARD-TSN and does not by itself start a recovery
+            // episode. Loss of reliable or still-retryable data does.
             if lost_retransmittable > 0 && !self.in_fast_recovery {
                 // RFC 8985 9.3 / RFC 9260 7.2.3: one cwnd reduction per recovery episode
                 self.in_fast_recovery = true;
@@ -3559,24 +3572,22 @@ impl Association {
         }
         let deadline = now + Duration::from_millis(pto);
         // RFC 8985 7.2: never later than the RTO.
-        if let Some(t3) = self.timers.get(Timer::T3RTX) {
-            if deadline >= t3 {
-                self.timers.set(Timer::Pto, None);
-                return;
-            }
+        if let Some(t3) = self.timers.get(Timer::T3RTX)
+            && deadline >= t3
+        {
+            self.timers.set(Timer::Pto, None);
+            return;
         }
         self.timers.set(Timer::Pto, Some(deadline));
     }
 
     /// RFC 8985 7.3: probe with the highest outstanding chunk to elicit a SACK.
     fn on_pto_timeout(&mut self, _now: Instant) {
-        let probe = self
-            .inflight_queue
-            .sorted
-            .iter()
-            .rev()
-            .copied()
-            .find(|t| self.inflight_queue.get(*t).is_some_and(|c| c.is_outstanding()));
+        let probe = self.inflight_queue.sorted.iter().rev().copied().find(|t| {
+            self.inflight_queue
+                .get(*t)
+                .is_some_and(|c| c.is_outstanding())
+        });
         if let Some(tsn) = probe {
             if let Some(c) = self.inflight_queue.get_mut(tsn) {
                 c.retransmit = true;

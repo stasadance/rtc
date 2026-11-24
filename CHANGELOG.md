@@ -33,6 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - DTLS record-protection benchmarks (`cargo bench --package rtc-dtls --bench record_protection`)
   and SRTP AEAD plus context-construction benchmarks, all reporting each enabled provider under
   identical inputs and separating one-time key-schedule cost from per-packet cost.
+- **Opt-in RACK-TLP loss detection for SCTP (RFC 8985).** `TransportConfig::with_rack` /
+  `SettingEngineBuilder::with_sctp_rack` enable time-based loss detection and a tail loss probe,
+  so a lost tail chunk is recovered in about 2·SRTT instead of after a T3-rtx timeout (which
+  collapses cwnd to one MTU and backs off the RTO). Off by default.
+- `TransportConfig::with_rto_min` / `SettingEngineBuilder::with_sctp_rto_min` override the SCTP
+  RTO lower bound (RFC 9260 default 1 s).
+- With RACK enabled, loss of DATA that will not be retransmitted (partial reliability with the
+  retransmission or lifetime limit exhausted) no longer reduces cwnd on its own.
+- `Association::transport_stats()` and `RTCPeerConnection::sctp_transport_stats()` return a
+  cheap snapshot of SCTP sender state (SRTT, RTO, min RTT, cwnd, ssthresh, rwnd, in-flight,
+  pending and acked bytes, RACK, T3-rtx and fast-retransmit counters) for application pacing.
 
 ### Changed
 

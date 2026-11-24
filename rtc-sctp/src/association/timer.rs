@@ -177,7 +177,7 @@ impl TimerTable {
 // both T1-init and T1-cookie before an RTT measurement is available.
 const RTO_INITIAL: u64 = 1000; // msec
 const RTO_MIN: u64 = 1000; // msec
-const RTO_MAX: u64 = 60000; // msec
+pub(crate) const RTO_MAX: u64 = 60000; // msec
 const RTO_ALPHA: u64 = 1;
 const RTO_BETA: u64 = 2;
 const RTO_BASE: u64 = 8;

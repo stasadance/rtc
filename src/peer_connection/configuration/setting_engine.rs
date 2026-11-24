@@ -376,9 +376,9 @@ pub struct SettingEngine {
     pub(crate) sctp_mtu: Option<u32>,
     /// SCTP streams share the bytes sent by weight (RFC 8260 section 3.6), off by default.
     pub(crate) sctp_weighted_fair_queueing: bool,
-    /// RACK-TLP loss detection on the SCTP association (lagless fork).
+    /// RACK-TLP loss detection on the SCTP association, off by default.
     pub(crate) sctp_rack: bool,
-    /// SCTP RTO lower bound override in ms (lagless fork).
+    /// SCTP RTO lower bound override in ms; `None` keeps the RFC 9260 default.
     pub(crate) sctp_rto_min: Option<u64>,
     pub(crate) ignore_rid_pause_for_recv: bool,
     pub(crate) write_ssrc_attributes_for_simulcast: bool,

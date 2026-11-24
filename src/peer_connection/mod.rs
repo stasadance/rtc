@@ -2419,6 +2419,18 @@ impl RTCPeerConnection {
         }
     }
 
+    /// Live SCTP sender state of the data-channel association:
+    /// srtt, min RTT, cwnd, in-flight/pending bytes, acked bytes, loss-recovery
+    /// counters. `None` before the association exists. Unlike [`Self::get_stats`],
+    /// this is a cheap snapshot meant to be polled, e.g. by an application pacer.
+    pub fn sctp_transport_stats(&self) -> Option<::sctp::TransportStats> {
+        self.sctp_transport()
+            .sctp_associations
+            .values()
+            .next()
+            .map(|a| a.transport_stats())
+    }
+
     /// Returns a snapshot of accumulated statistics.
     ///
     /// This method creates an immutable snapshot of WebRTC statistics
@@ -2475,17 +2487,6 @@ impl RTCPeerConnection {
     ///
     /// See [getStats](https://www.w3.org/TR/webrtc/#widl-RTCPeerConnection-getStats-Promise-RTCStatsReport--MediaStreamTrack-selector) and
     /// [The stats selection algorithm](https://www.w3.org/TR/webrtc/#the-stats-selection-algorithm)
-    /// Live SCTP sender state of the data-channel association (lagless fork):
-    /// srtt, min RTT, cwnd, in-flight/pending bytes, acked bytes. `None` before
-    /// the association exists.
-    pub fn sctp_transport_stats(&self) -> Option<::sctp::TransportStats> {
-        self.sctp_transport()
-            .sctp_associations
-            .values()
-            .next()
-            .map(|a| a.transport_stats())
-    }
-
     pub fn get_stats(&mut self, now: Instant, selector: StatsSelector) -> RTCStatsReport {
         // Update ICE agent stats before taking snapshot
         self.update_ice_agent_stats(now);
