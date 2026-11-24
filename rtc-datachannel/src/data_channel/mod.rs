@@ -283,6 +283,20 @@ impl DataChannel {
         Ok(())
     }
 
+    /// Sets this channel's stream weight under weighted fair queueing, in data channel
+    /// priority units (RFC 8832: 128, 256, 512, 1024). No effect under first-come-first-served.
+    pub fn set_priority(&mut self, priority: u16) -> Result<()> {
+        let msg = Message::DataChannelThreshold(DataChannelThreshold::Priority(priority as u32)).marshal()?;
+        self.write_outs.push_back(DataChannelMessage {
+            association_handle: self.association_handle,
+            stream_id: self.stream_id,
+            ppi: PayloadProtocolIdentifier::Dcep,
+            payload: msg,
+            negotiated: false,
+        });
+        Ok(())
+    }
+
     fn write_data_channel_low_threshold(&mut self, threshold: u32) -> Result<()> {
         let low_threshold =
             Message::DataChannelThreshold(DataChannelThreshold::Low(threshold)).marshal()?;
