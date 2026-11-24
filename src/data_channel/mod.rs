@@ -260,6 +260,27 @@ impl RTCDataChannel<'_> {
         }
     }
 
+    /// Sets this channel's share of the SCTP send bandwidth under weighted fair queueing
+    /// ([`SettingEngineBuilder::with_sctp_weighted_fair_queueing`]), in data channel priority
+    /// units (RFC 8832: 128 very-low, 256 low/normal, 512 medium, 1024 high). Messages written
+    /// afterwards use it. No effect under the default first-come-first-served scheduler.
+    ///
+    /// [`SettingEngineBuilder::with_sctp_weighted_fair_queueing`]: crate::peer_connection::configuration::setting_engine::SettingEngineBuilder::with_sctp_weighted_fair_queueing
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ErrDataChannelNotOpen`] until the channel's SCTP stream exists.
+    pub fn set_priority(&mut self, priority: u16) -> Result<()> {
+        let dc = self
+            .peer_connection
+            .data_channels
+            .get_mut(&self.id)
+            .ok_or(Error::ErrDataChannelClosed)?;
+        let data_channel = dc.data_channel.as_mut().ok_or(Error::ErrDataChannelNotOpen)?;
+        data_channel.set_priority(priority)?;
+        Ok(())
+    }
+
     /// The threshold at which the buffered amount is considered low.
     ///
     /// When the buffered amount falls from above this threshold to at or below it, the

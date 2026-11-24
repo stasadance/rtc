@@ -748,6 +748,9 @@ impl<'a>
                                     stream
                                         .set_buffered_amount_high_threshold(threshold as usize)?;
                                 }
+                                DataChannelThreshold::Priority(priority) => {
+                                    stream.set_priority(priority.min(u16::MAX as u32) as u16)?;
+                                }
                             }
                         }
                         _ => {}

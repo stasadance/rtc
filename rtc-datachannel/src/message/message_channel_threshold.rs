@@ -22,6 +22,8 @@ pub enum DataChannelThreshold {
     Low(u32),
     /// The buffered amount rose to or above the high threshold, carrying its value.
     High(u32),
+    /// Set the stream's weight under weighted fair queueing (data channel priority units).
+    Priority(u32),
 } // internal usage only
 
 impl MarshalSize for DataChannelThreshold {
@@ -41,6 +43,10 @@ impl Marshal for DataChannelThreshold {
                 buf.put_u8(1);
                 buf.put_u32(threshold);
             }
+            DataChannelThreshold::Priority(priority) => {
+                buf.put_u8(2);
+                buf.put_u32(priority);
+            }
         }
 
         Ok(self.marshal_size())
@@ -55,10 +61,10 @@ impl Unmarshal for DataChannelThreshold {
     {
         let t = buf.get_u8();
         let v = buf.get_u32();
-        if t == 0 {
-            Ok(DataChannelThreshold::Low(v))
-        } else {
-            Ok(DataChannelThreshold::High(v))
+        match t {
+            0 => Ok(DataChannelThreshold::Low(v)),
+            2 => Ok(DataChannelThreshold::Priority(v)),
+            _ => Ok(DataChannelThreshold::High(v)),
         }
     }
 }
