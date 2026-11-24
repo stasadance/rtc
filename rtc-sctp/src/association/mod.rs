@@ -296,6 +296,9 @@ pub struct Association {
     max_receive_buffer_size: u32,
     // my congestion window size
     pub(crate) cwnd: u32,
+    /// lower bound for cwnd after a loss-driven reduction (not after RTO); set by an
+    /// application pacer that controls the send rate itself. 0 = off.
+    pub(crate) cwnd_floor: u32,
     // calculated peer's receiver windows size
     rwnd: u32,
     // slow start threshold
@@ -396,6 +399,7 @@ impl Default for Association {
             max_receive_buffer_size: 0,
             // my congestion window size
             cwnd: 0,
+            cwnd_floor: 0,
             // calculated peer's receiver windows size
             rwnd: 0,
             // slow start threshold
@@ -676,6 +680,15 @@ impl Association {
     }
 
     /// Live sender-side transport state, for application pacing.
+    /// A loss-driven cwnd reduction (fast recovery, RACK) does not go below `bytes`.
+    /// It never raises cwnd by itself, and an RTO still collapses cwnd to one MTU
+    /// (RFC 9260 7.2.3). Meant for an application pacer that already limits the send
+    /// rate from delivery rate and RTT, so random (non-congestion) loss does not
+    /// halve the window below what that rate needs. 0 disables.
+    pub fn set_cwnd_floor(&mut self, bytes: u32) {
+        self.cwnd_floor = bytes;
+    }
+
     pub fn transport_stats(&self) -> TransportStats {
         TransportStats {
             srtt_ms: self.rto_mgr.srtt,
@@ -2126,7 +2139,7 @@ impl Association {
                             //     last sent, according to the formula described in Section 7.2.3.
                             self.in_fast_recovery = true;
                             self.fast_recover_exit_point = htna;
-                            self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
+                            self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu).max(self.cwnd_floor);
                             self.cwnd = self.ssthresh;
                             self.partial_bytes_acked = 0;
                             self.will_retransmit_fast = true;
@@ -3549,7 +3562,7 @@ impl Association {
                 // RFC 8985 9.3 / RFC 9260 7.2.3: one cwnd reduction per recovery episode
                 self.in_fast_recovery = true;
                 self.fast_recover_exit_point = self.my_next_tsn.wrapping_sub(1);
-                self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
+                self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu).max(self.cwnd_floor);
                 self.cwnd = self.ssthresh;
                 self.partial_bytes_acked = 0;
             }

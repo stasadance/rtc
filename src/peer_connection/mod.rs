@@ -2431,6 +2431,14 @@ impl RTCPeerConnection {
             .map(|a| a.transport_stats())
     }
 
+    /// Lower bound for the data-channel association's cwnd after loss-driven
+    /// reductions; see `sctp::Association::set_cwnd_floor`. 0 disables.
+    pub fn set_sctp_cwnd_floor(&mut self, bytes: u32) {
+        for a in self.sctp_transport_mut().sctp_associations.values_mut() {
+            a.set_cwnd_floor(bytes);
+        }
+    }
+
     /// Returns a snapshot of accumulated statistics.
     ///
     /// This method creates an immutable snapshot of WebRTC statistics
