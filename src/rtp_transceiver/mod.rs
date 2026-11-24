@@ -479,4 +479,91 @@ mod tests {
             "setting the same direction must not trigger negotiation-needed",
         );
     }
+
+    #[test]
+    fn test_add_track_to_transceiver_picks_the_mline() {
+        use crate::media_stream::MediaStreamTrack;
+        use crate::rtp_transceiver::RTCRtpTransceiverInit;
+        use crate::rtp_transceiver::rtp_sender::{
+            RTCRtpCodingParameters, RTCRtpEncodingParameters,
+        };
+
+        let mut offerer = build_pc();
+        let mut answerer = build_pc();
+
+        // offer: mic (sendonly) then two playback slots (recvonly), like a voice client
+        let mic = RTCRtpEncodingParameters {
+            rtp_coding_parameters: RTCRtpCodingParameters {
+                ssrc: Some(1111),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        offerer
+            .add_transceiver_from_kind(
+                RtpCodecKind::Audio,
+                Some(RTCRtpTransceiverInit {
+                    direction: RTCRtpTransceiverDirection::Sendonly,
+                    streams: vec![],
+                    send_encodings: vec![mic],
+                }),
+            )
+            .expect("add mic");
+        for _ in 0..2 {
+            offerer
+                .add_transceiver_from_kind(RtpCodecKind::Audio, None)
+                .expect("add slot");
+        }
+        let offer = offerer.create_offer(None).expect("create offer");
+        offerer
+            .set_local_description(Instant::now(), offer.clone())
+            .expect("offerer set local");
+        answerer
+            .set_remote_description(Instant::now(), offer)
+            .expect("answerer set remote");
+
+        // the second slot (third m-line)
+        let slot = answerer
+            .get_transceivers()
+            .find(|&t| answerer.rtp_transceivers[t].mid().as_deref() == Some("2"))
+            .expect("transceiver for mid 2");
+        let track = MediaStreamTrack::new(
+            "germs".to_owned(),
+            "voice1".to_owned(),
+            "voice1".to_owned(),
+            RtpCodecKind::Audio,
+            vec![RTCRtpEncodingParameters {
+                rtp_coding_parameters: RTCRtpCodingParameters {
+                    ssrc: Some(4242),
+                    ..Default::default()
+                },
+                codec: answerer
+                    .media_engine
+                    .get_codecs_by_kind(RtpCodecKind::Audio)[0]
+                    .rtp_codec
+                    .clone(),
+                ..Default::default()
+            }],
+        );
+        answerer
+            .add_track_to_transceiver(slot, track.clone())
+            .expect("attach to mid 2");
+        assert!(
+            answerer.add_track_to_transceiver(slot, track).is_err(),
+            "a transceiver that already sends must be refused"
+        );
+
+        let answer = answerer.create_answer(None).expect("create answer");
+        let sections: Vec<&str> = answer.sdp.split("\r\nm=").skip(1).collect();
+        assert_eq!(sections.len(), 3);
+        assert!(sections[0].contains("a=mid:0") && sections[0].contains("a=recvonly"));
+        assert!(
+            !sections[0].contains("a=ssrc:"),
+            "mic m-line must not get a sender"
+        );
+        assert!(sections[1].contains("a=mid:1") && !sections[1].contains("a=ssrc:"));
+        assert!(sections[2].contains("a=mid:2") && sections[2].contains("a=sendonly"));
+        assert!(sections[2].contains("a=ssrc:4242 cname:germs"));
+        assert!(sections[2].contains("a=msid:germs voice1"));
+    }
 }

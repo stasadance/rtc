@@ -2103,35 +2103,18 @@ impl RTCPeerConnection {
             return Err(Error::ErrConnectionClosed);
         }
 
+        let free = self.rtp_transceivers.iter().position(|transceiver| {
+            !transceiver.stopped()
+                && transceiver.kind() == track.kind()
+                && transceiver.sender().is_none()
+        });
+        if let Some(id) = free {
+            return self.add_track_to_transceiver(id, track);
+        }
+
         let send_encodings = self.send_encodings_from_track(&track);
         let (track, send_encodings, codec_preferences) =
             self.normalize_sender_track(track, send_encodings)?;
-        for (id, transceiver) in self.rtp_transceivers.iter_mut().enumerate() {
-            if !transceiver.stopped()
-                && transceiver.kind() == track.kind()
-                && transceiver.sender().is_none()
-            {
-                let mut sender =
-                    RTCRtpSenderInternal::new(track.kind(), track, vec![], send_encodings);
-
-                if transceiver.get_codec_preferences().is_empty() && !codec_preferences.is_empty() {
-                    transceiver.set_codec_preferences(codec_preferences, &self.media_engine)?;
-                }
-
-                sender.set_codec_preferences(transceiver.get_codec_preferences().to_vec());
-
-                transceiver.sender_mut().replace(sender);
-
-                transceiver.set_direction(RTCRtpTransceiverDirection::from_send_recv(
-                    true,
-                    transceiver.direction().has_recv(),
-                ));
-
-                self.trigger_negotiation_needed();
-                return Ok(RTCRtpSenderId(id));
-            }
-        }
-
         let mut transceiver = self.new_transceiver_from_track(
             track,
             RTCRtpTransceiverInit {
@@ -2144,6 +2127,59 @@ impl RTCPeerConnection {
             transceiver.set_codec_preferences(codec_preferences, &self.media_engine)?;
         }
         Ok(RTCRtpSenderId(self.add_rtp_transceiver(transceiver)))
+    }
+
+    /// Attaches a track to one specific transceiver, as [`add_track`](Self::add_track) does for
+    /// the first free transceiver of the track's kind.
+    ///
+    /// An answerer uses this to pick which offered m-line sends which track: after
+    /// `set_remote_description`, each offered m-line has a transceiver with its mid, and
+    /// `add_track` would always take the first free one of that kind (which may be an m-line
+    /// the remote only sends on).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the peer connection is closed, the transceiver does not exist,
+    /// is stopped, already has a sender, or is of another kind than the track.
+    pub fn add_track_to_transceiver(
+        &mut self,
+        id: RTCRtpTransceiverId,
+        track: MediaStreamTrack,
+    ) -> Result<RTCRtpSenderId> {
+        if self.peer_connection_state == RTCPeerConnectionState::Closed {
+            return Err(Error::ErrConnectionClosed);
+        }
+        match self.rtp_transceivers.get(id) {
+            None => return Err(Error::ErrRTPTransceiverNotExisted),
+            Some(t) if t.stopped() => return Err(Error::ErrConnectionClosed),
+            Some(t) if t.sender().is_some() => return Err(Error::ErrExistingTrack),
+            Some(t) if t.kind() != track.kind() => {
+                return Err(Error::ErrRTPSenderNewTrackHasIncorrectKind);
+            }
+            Some(_) => {}
+        }
+
+        let send_encodings = self.send_encodings_from_track(&track);
+        let (track, send_encodings, codec_preferences) =
+            self.normalize_sender_track(track, send_encodings)?;
+        let transceiver = &mut self.rtp_transceivers[id];
+        let mut sender = RTCRtpSenderInternal::new(track.kind(), track, vec![], send_encodings);
+
+        if transceiver.get_codec_preferences().is_empty() && !codec_preferences.is_empty() {
+            transceiver.set_codec_preferences(codec_preferences, &self.media_engine)?;
+        }
+
+        sender.set_codec_preferences(transceiver.get_codec_preferences().to_vec());
+
+        transceiver.sender_mut().replace(sender);
+
+        transceiver.set_direction(RTCRtpTransceiverDirection::from_send_recv(
+            true,
+            transceiver.direction().has_recv(),
+        ));
+
+        self.trigger_negotiation_needed();
+        Ok(RTCRtpSenderId(id))
     }
 
     /// Removes a track from the peer connection.
